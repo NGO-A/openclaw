@@ -1,0 +1,60 @@
+{
+  "id": "smart-model-router",
+  "activation": {
+    "onStartup": true
+  },
+  "enabledByDefault": true,
+  "name": "Smart Model Router",
+  "description": "Automatically routes chat turns to an appropriate model and thinking level using manifest-backed heuristics, local support routes, and safe trace metadata.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "quickModel": { "type": "string", "minLength": 1 },
+      "normalModel": { "type": "string", "minLength": 1 },
+      "deepModel": { "type": "string", "minLength": 1 },
+      "codeModel": { "type": "string", "minLength": 1 },
+      "visionModel": { "type": "string", "minLength": 1 },
+      "longContextModel": { "type": "string", "minLength": 1 },
+      "localHelperProvider": { "type": "string", "minLength": 1 },
+      "localHelperModel": { "type": "string", "minLength": 1 },
+      "localSupportModel": { "type": "string", "minLength": 1 },
+      "localCodeModel": { "type": "string", "minLength": 1 },
+      "allowLocalSupport": { "type": "boolean" },
+      "allowLocalSimpleCode": { "type": "boolean" },
+      "allowLocalFinal": { "type": "boolean" },
+      "enableLongContextRoute": { "type": "boolean" },
+      "longContextTokenThreshold": { "type": "number", "minimum": 1024 },
+      "minFreeVramGbForLocal": { "type": "number", "minimum": 0 },
+      "nvidiaCatalog": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "refreshHours": { "type": "number", "minimum": 1 }
+        }
+      },
+      "fallback": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "maxAttempts": { "type": "number", "minimum": 0 },
+          "allowAfterFirstToken": { "type": "boolean" },
+          "authFallback": { "type": "boolean" },
+          "rateLimitFallback": { "type": "boolean" },
+          "toolCallFallback": { "type": "boolean" }
+        }
+      },
+      "trace": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "maxEntries": { "type": "number", "minimum": 1 }
+        }
+      }
+    }
+  }
+}

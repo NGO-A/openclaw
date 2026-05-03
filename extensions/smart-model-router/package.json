@@ -1,0 +1,15 @@
+{
+  "name": "@openclaw/smart-model-router",
+  "version": "2026.5.3",
+  "private": true,
+  "description": "OpenClaw smart model routing plugin",
+  "type": "module",
+  "devDependencies": {
+    "@openclaw/plugin-sdk": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
