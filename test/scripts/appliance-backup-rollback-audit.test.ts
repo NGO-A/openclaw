@@ -7,6 +7,7 @@ import {
   buildOpenClawBackupArgs,
   createPluginWriteArchive,
   pruneBackupArchives,
+  resolveOpenClawBackupInvocation,
   runVerifiedBackup,
   restorePluginWriteArchive,
   runRollbackDrill,
@@ -381,11 +382,7 @@ describe("appliance backup rollback audit helpers", () => {
       noIncludeWorkspace: true,
       retentionCount: 7,
       retentionDays: 30,
-      backupRunner: async (
-        resolvedOutputDir: string,
-        dryRun: boolean,
-        noIncludeWorkspace: boolean,
-      ) => {
+      backupRunner: async ({ outputDir: resolvedOutputDir, dryRun, noIncludeWorkspace }) => {
         backupCalls.push({
           outputDir: resolvedOutputDir,
           dryRun,
@@ -411,7 +408,6 @@ describe("appliance backup rollback audit helpers", () => {
         dryRun: true,
         noIncludeWorkspace: true,
         args: [
-          "openclaw",
           "backup",
           "create",
           "--output",
@@ -433,5 +429,74 @@ describe("appliance backup rollback audit helpers", () => {
         noIncludeWorkspace: true,
       }),
     ]);
+  });
+
+  it("selects a global openclaw command from PATH before the pnpm fallback", async () => {
+    const root = await makeTempDir();
+    const binDir = path.join(root, "bin");
+    const openclawPath = path.join(binDir, "openclaw");
+    const outputDir = path.join(root, "backups");
+    await fs.mkdir(binDir, { recursive: true });
+    await fs.writeFile(openclawPath, "#!/bin/sh\nexit 0\n", "utf8");
+    await fs.chmod(openclawPath, 0o755);
+
+    await expect(
+      resolveOpenClawBackupInvocation({
+        outputDir,
+        dryRun: true,
+        noIncludeWorkspace: true,
+        env: { PATH: binDir },
+      }),
+    ).resolves.toEqual({
+      command: openclawPath,
+      source: "path",
+      args: [
+        "backup",
+        "create",
+        "--output",
+        outputDir,
+        "--verify",
+        "--json",
+        "--no-include-workspace",
+        "--dry-run",
+      ],
+    });
+  });
+
+  it("prefers an explicit appliance backup command from the environment", async () => {
+    const root = await makeTempDir();
+    const outputDir = path.join(root, "backups");
+    const command = path.join(root, "custom-openclaw");
+
+    await expect(
+      resolveOpenClawBackupInvocation({
+        outputDir,
+        dryRun: false,
+        noIncludeWorkspace: false,
+        env: { OPENCLAW_APPLIANCE_BACKUP_COMMAND: command, PATH: "" },
+      }),
+    ).resolves.toEqual({
+      command,
+      source: "override",
+      args: ["backup", "create", "--output", outputDir, "--verify", "--json"],
+    });
+  });
+
+  it("falls back to pnpm openclaw when no openclaw command is available", async () => {
+    const root = await makeTempDir();
+    const outputDir = path.join(root, "backups");
+
+    await expect(
+      resolveOpenClawBackupInvocation({
+        outputDir,
+        dryRun: false,
+        noIncludeWorkspace: false,
+        env: { PATH: path.join(root, "missing-bin") },
+      }),
+    ).resolves.toEqual({
+      command: "pnpm",
+      source: "pnpm-fallback",
+      args: ["openclaw", "backup", "create", "--output", outputDir, "--verify", "--json"],
+    });
   });
 });

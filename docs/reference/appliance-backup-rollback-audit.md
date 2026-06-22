@@ -34,7 +34,9 @@ node scripts/appliance-backup-rollback-audit.mjs backup \
 
 The wrapper runs `openclaw backup create --verify --json`, then prunes old
 archives. A backup is not considered successful unless archive verification
-passes.
+passes. On appliances, the wrapper prefers an explicit `--openclaw-command` or
+`OPENCLAW_APPLIANCE_BACKUP_COMMAND`, then an `openclaw` executable found on
+`PATH`, and only falls back to `pnpm openclaw` for repo development.
 
 If the appliance config is damaged and workspace discovery blocks backup
 creation, run the wrapper with `--no-include-workspace` for a partial config and

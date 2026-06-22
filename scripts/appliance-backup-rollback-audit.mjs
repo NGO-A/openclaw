@@ -8,10 +8,11 @@ import process from "node:process";
 
 const BACKUP_ARCHIVE_PATTERN = /openclaw-backup\.tar\.gz$/u;
 const SAFE_PATH_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
+const OPENCLAW_BACKUP_COMMAND_ENV = "OPENCLAW_APPLIANCE_BACKUP_COMMAND";
 
 function usage() {
   return `Usage:
-  node scripts/appliance-backup-rollback-audit.mjs backup --output <dir> [--retention-count 14] [--retention-days 90] [--audit-log <file>] [--dry-run] [--no-include-workspace] [--json]
+  node scripts/appliance-backup-rollback-audit.mjs backup --output <dir> [--retention-count 14] [--retention-days 90] [--audit-log <file>] [--dry-run] [--no-include-workspace] [--openclaw-command <path>] [--json]
   node scripts/appliance-backup-rollback-audit.mjs archive --manifest <file> --cold-storage <dir> --audit-log <file> [--plugin <id>] [--approved-by <name>] [--approval-id <id>] [--reason <text>] [--json]
   node scripts/appliance-backup-rollback-audit.mjs restore --archive <dir> --audit-log <file> --allowed-target-root <dir> [--allowed-target-root <dir>...] [--approved-by <name>] [--approval-id <id>] [--reason <text>] [--json]
   node scripts/appliance-backup-rollback-audit.mjs drill --work-dir <dir> --cold-storage <dir> --audit-log <file> [--json]
@@ -131,6 +132,33 @@ function assertPathInside(parentPath, targetPath, label) {
     return target;
   }
   throw new Error(`${label} must remain under ${parent}`);
+}
+
+function assertSafeCommand(value, label) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${label} must be a non-empty command`);
+  }
+  if (value.includes("\0")) {
+    throw new Error(`${label} must not contain NUL bytes`);
+  }
+  return value.trim();
+}
+
+async function findExecutableInPath(command, pathValue = process.env.PATH) {
+  const searchPath = typeof pathValue === "string" ? pathValue : "";
+  for (const entry of searchPath.split(path.delimiter)) {
+    if (!entry) {
+      continue;
+    }
+    const candidate = path.join(entry, command);
+    try {
+      await fs.access(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Continue through PATH; absence here only matters if every entry misses.
+    }
+  }
+  return null;
 }
 
 function normalizeAllowedTargetRoots(rawAllowedTargetRoots) {
@@ -568,7 +596,7 @@ export async function pruneBackupArchives(params) {
 }
 
 export function buildOpenClawBackupArgs(outputDir, dryRun, noIncludeWorkspace) {
-  const args = ["openclaw", "backup", "create", "--output", outputDir, "--verify", "--json"];
+  const args = ["backup", "create", "--output", outputDir, "--verify", "--json"];
   if (noIncludeWorkspace) {
     args.push("--no-include-workspace");
   }
@@ -578,12 +606,49 @@ export function buildOpenClawBackupArgs(outputDir, dryRun, noIncludeWorkspace) {
   return args;
 }
 
-function runPnpmOpenClawBackup(outputDir, dryRun, noIncludeWorkspace) {
-  const args = buildOpenClawBackupArgs(outputDir, dryRun, noIncludeWorkspace);
+export async function resolveOpenClawBackupInvocation(params) {
+  const commandOverride =
+    params.openclawCommand ??
+    (typeof params.env?.[OPENCLAW_BACKUP_COMMAND_ENV] === "string"
+      ? params.env[OPENCLAW_BACKUP_COMMAND_ENV]
+      : undefined);
+  const backupArgs = buildOpenClawBackupArgs(
+    params.outputDir,
+    params.dryRun,
+    params.noIncludeWorkspace,
+  );
+  if (commandOverride !== undefined) {
+    return {
+      command: assertSafeCommand(commandOverride, OPENCLAW_BACKUP_COMMAND_ENV),
+      args: backupArgs,
+      source: "override",
+    };
+  }
+
+  const openclawCommand = await findExecutableInPath("openclaw", params.env?.PATH);
+  if (openclawCommand) {
+    return { command: openclawCommand, args: backupArgs, source: "path" };
+  }
+
+  return { command: "pnpm", args: ["openclaw", ...backupArgs], source: "pnpm-fallback" };
+}
+
+async function runOpenClawBackup(params) {
+  const invocation = await resolveOpenClawBackupInvocation({
+    outputDir: params.outputDir,
+    dryRun: params.dryRun,
+    noIncludeWorkspace: params.noIncludeWorkspace,
+    openclawCommand: params.openclawCommand,
+    env: params.env,
+  });
   return new Promise((resolve, reject) => {
-    const child = spawn("pnpm", args, {
+    const child = spawn(invocation.command, invocation.args, {
       cwd: process.cwd(),
-      env: { ...process.env, XDG_DATA_HOME: process.env.XDG_DATA_HOME ?? "/tmp/xdg" },
+      env: {
+        ...process.env,
+        ...params.env,
+        XDG_DATA_HOME: params.env?.XDG_DATA_HOME ?? process.env.XDG_DATA_HOME ?? "/tmp/xdg",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -597,7 +662,7 @@ function runPnpmOpenClawBackup(outputDir, dryRun, noIncludeWorkspace) {
     child.on("error", reject);
     child.on("close", (code) => {
       if (code === 0) {
-        resolve({ stdout, stderr });
+        resolve({ stdout, stderr, invocation });
         return;
       }
       reject(new Error(`openclaw backup failed with exit ${code}: ${stderr || stdout}`));
@@ -608,12 +673,14 @@ function runPnpmOpenClawBackup(outputDir, dryRun, noIncludeWorkspace) {
 export async function runVerifiedBackup(params) {
   const outputDir = path.resolve(params.outputDir);
   await fs.mkdir(outputDir, { recursive: true, mode: 0o700 });
-  const backupRunner = params.backupRunner ?? runPnpmOpenClawBackup;
-  const backup = await backupRunner(
+  const backupRunner = params.backupRunner ?? runOpenClawBackup;
+  const backup = await backupRunner({
     outputDir,
-    params.dryRun === true,
-    params.noIncludeWorkspace === true,
-  );
+    dryRun: params.dryRun === true,
+    noIncludeWorkspace: params.noIncludeWorkspace === true,
+    openclawCommand: params.openclawCommand,
+    env: params.env ?? process.env,
+  });
   const pruning = await pruneBackupArchives({
     backupDir: outputDir,
     retentionCount: params.retentionCount,
@@ -698,6 +765,7 @@ async function main() {
           retentionDays: optionalInteger(opts, "retention-days", 90),
           dryRun: opts["dry-run"] === true,
           noIncludeWorkspace: opts["no-include-workspace"] === true,
+          openclawCommand: optionalString(opts, "openclaw-command"),
         });
         break;
       case "archive":
