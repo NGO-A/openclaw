@@ -13,9 +13,17 @@ function usage() {
   return `Usage:
   node scripts/appliance-backup-rollback-audit.mjs backup --output <dir> [--retention-count 14] [--retention-days 90] [--audit-log <file>] [--dry-run] [--no-include-workspace] [--json]
   node scripts/appliance-backup-rollback-audit.mjs archive --manifest <file> --cold-storage <dir> --audit-log <file> [--plugin <id>] [--approved-by <name>] [--approval-id <id>] [--reason <text>] [--json]
-  node scripts/appliance-backup-rollback-audit.mjs restore --archive <dir> --audit-log <file> [--approved-by <name>] [--approval-id <id>] [--reason <text>] [--json]
+  node scripts/appliance-backup-rollback-audit.mjs restore --archive <dir> --audit-log <file> --allowed-target-root <dir> [--allowed-target-root <dir>...] [--approved-by <name>] [--approval-id <id>] [--reason <text>] [--json]
   node scripts/appliance-backup-rollback-audit.mjs drill --work-dir <dir> --cold-storage <dir> --audit-log <file> [--json]
 `;
+}
+
+function setOption(opts, name, value) {
+  if (opts[name] === undefined) {
+    opts[name] = value;
+    return;
+  }
+  opts[name] = Array.isArray(opts[name]) ? [...opts[name], value] : [opts[name], value];
 }
 
 function parseArgs(argv) {
@@ -29,16 +37,16 @@ function parseArgs(argv) {
     }
     const eq = arg.indexOf("=");
     if (eq !== -1) {
-      opts[arg.slice(2, eq)] = arg.slice(eq + 1);
+      setOption(opts, arg.slice(2, eq), arg.slice(eq + 1));
       continue;
     }
     const name = arg.slice(2);
     const next = rest[i + 1];
     if (!next || next.startsWith("--")) {
-      opts[name] = true;
+      setOption(opts, name, true);
       continue;
     }
-    opts[name] = next;
+    setOption(opts, name, next);
     i += 1;
   }
   return { command, opts };
@@ -55,6 +63,19 @@ function requireString(opts, name) {
 function optionalString(opts, name) {
   const value = opts[name];
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function requireStringList(opts, name) {
+  const value = opts[name];
+  const values = Array.isArray(value) ? value : value === undefined ? [] : [value];
+  const strings = values.filter((entry) => typeof entry === "string" && entry.trim() !== "");
+  if (strings.length === 0) {
+    throw new Error(`Missing required --${name}`);
+  }
+  if (strings.length !== values.length) {
+    throw new Error(`--${name} must be provided with a non-empty value`);
+  }
+  return strings;
 }
 
 function optionalInteger(opts, name, fallback) {
@@ -110,6 +131,77 @@ function assertPathInside(parentPath, targetPath, label) {
     return target;
   }
   throw new Error(`${label} must remain under ${parent}`);
+}
+
+function normalizeAllowedTargetRoots(rawAllowedTargetRoots) {
+  const roots = Array.isArray(rawAllowedTargetRoots)
+    ? rawAllowedTargetRoots
+    : rawAllowedTargetRoots == null
+      ? []
+      : [rawAllowedTargetRoots];
+  if (roots.length === 0) {
+    throw new Error("Restore requires at least one allowed target root");
+  }
+  return roots.map((root, index) => {
+    if (typeof root !== "string" || root.trim() === "") {
+      throw new Error(`allowedTargetRoots[${index}] must be a non-empty string`);
+    }
+    return assertAbsoluteSafePath(root);
+  });
+}
+
+function assertTargetPathAllowed(targetPath, allowedTargetRoots, index) {
+  for (const root of allowedTargetRoots) {
+    try {
+      return assertPathInside(root, targetPath, `Archive manifest entry ${index} targetPath`);
+    } catch {
+      // Keep checking remaining allowed roots before reporting the trust-boundary failure.
+    }
+  }
+  throw new Error(
+    `Archive manifest entry ${index} targetPath must remain under an allowed target root`,
+  );
+}
+
+async function nearestExistingPath(targetPath) {
+  let candidate = path.resolve(targetPath);
+  while (true) {
+    try {
+      await fs.lstat(candidate);
+      return candidate;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+      const parent = path.dirname(candidate);
+      if (parent === candidate) {
+        throw new Error(`No existing filesystem ancestor for restore target: ${targetPath}`);
+      }
+      candidate = parent;
+    }
+  }
+}
+
+async function realpathForRestoreTarget(targetPath) {
+  try {
+    await fs.lstat(targetPath);
+    return await fs.realpath(targetPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+    return fs.realpath(await nearestExistingPath(path.dirname(targetPath)));
+  }
+}
+
+async function assertRestoreTargetsStayInsideAllowedRoots(entries, allowedTargetRoots) {
+  const realAllowedRoots = await Promise.all(
+    allowedTargetRoots.map(async (root) => fs.realpath(root)),
+  );
+  for (const [index, entry] of entries.entries()) {
+    const realTarget = await realpathForRestoreTarget(entry.targetPath);
+    assertTargetPathAllowed(realTarget, realAllowedRoots, index);
+  }
 }
 
 function assertArchiveRelativePath(archiveRoot, archivePath) {
@@ -310,11 +402,12 @@ export async function createPluginWriteArchive(params) {
   return { archivePath: archiveRoot, manifestPath, manifest };
 }
 
-function validateArchiveManifestEntry(archiveRoot, rawEntry, index) {
+function validateArchiveManifestEntry(archiveRoot, rawEntry, index, allowedTargetRoots) {
   if (!rawEntry || typeof rawEntry !== "object") {
     throw new Error(`Archive manifest entry ${index} must be an object`);
   }
   const targetPath = assertAbsoluteSafePath(rawEntry.targetPath);
+  assertTargetPathAllowed(targetPath, allowedTargetRoots, index);
   if (!/^[a-f0-9]{64}$/u.test(rawEntry.targetPathSha256)) {
     throw new Error(`Archive manifest entry ${index} targetPathSha256 must be a sha256 hex digest`);
   }
@@ -362,9 +455,11 @@ function validateArchiveManifestEntry(archiveRoot, rawEntry, index) {
   };
 }
 
-function validateArchiveManifestEntries(archiveRoot, manifest) {
+function validateArchiveManifestEntries(archiveRoot, manifest, allowedTargetRoots) {
   const entries = Array.isArray(manifest.entries) ? manifest.entries : [];
-  return entries.map((entry, index) => validateArchiveManifestEntry(archiveRoot, entry, index));
+  return entries.map((entry, index) =>
+    validateArchiveManifestEntry(archiveRoot, entry, index, allowedTargetRoots),
+  );
 }
 
 async function restoreEntry(entry) {
@@ -397,11 +492,13 @@ async function restoreEntry(entry) {
 
 export async function restorePluginWriteArchive(params) {
   const archiveRoot = path.resolve(params.archivePath);
+  const allowedTargetRoots = normalizeAllowedTargetRoots(params.allowedTargetRoots);
   const manifest = await readJsonFile(path.join(archiveRoot, "manifest.json"));
   if (manifest?.kind !== "openclaw-appliance-plugin-write-archive") {
     throw new Error(`Unsupported rollback archive manifest in ${archiveRoot}`);
   }
-  const entries = validateArchiveManifestEntries(archiveRoot, manifest);
+  const entries = validateArchiveManifestEntries(archiveRoot, manifest, allowedTargetRoots);
+  await assertRestoreTargetsStayInsideAllowedRoots(entries, allowedTargetRoots);
   const restored = [];
   for (const entry of entries.toReversed()) {
     restored.push(await restoreEntry(entry));
@@ -560,6 +657,7 @@ export async function runRollbackDrill(params) {
   const restored = await restorePluginWriteArchive({
     archivePath: archive.archivePath,
     auditLogPath: params.auditLogPath,
+    allowedTargetRoots: [workDir],
     approvedBy: "bench-drill",
     approvalId: "bench-drill",
     reason: "restore synthetic corruption",
@@ -617,6 +715,7 @@ async function main() {
         result = await restorePluginWriteArchive({
           archivePath: requireString(opts, "archive"),
           auditLogPath: requireString(opts, "audit-log"),
+          allowedTargetRoots: requireStringList(opts, "allowed-target-root"),
           approvedBy: optionalString(opts, "approved-by"),
           approvalId: optionalString(opts, "approval-id"),
           reason: optionalString(opts, "reason"),

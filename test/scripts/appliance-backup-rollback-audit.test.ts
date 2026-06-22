@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -34,7 +35,7 @@ afterEach(async () => {
 });
 
 describe("appliance backup rollback audit helpers", () => {
-  it("archives original files before plugin writes and restores them during rollback", async () => {
+  it("archives original files before plugin writes and restores them under an allowed root", async () => {
     const root = await makeTempDir();
     const liveFile = path.join(root, "files", "matter.txt");
     const coldStorageDir = path.join(root, "cold-storage");
@@ -59,6 +60,7 @@ describe("appliance backup rollback audit helpers", () => {
     const restored = await restorePluginWriteArchive({
       archivePath: archive.archivePath,
       auditLogPath,
+      allowedTargetRoots: [root],
       approvedBy: "John",
       approvalId: "approval-rollback-1",
       reason: "rollback drill",
@@ -109,6 +111,7 @@ describe("appliance backup rollback audit helpers", () => {
     await restorePluginWriteArchive({
       archivePath: archive.archivePath,
       auditLogPath,
+      allowedTargetRoots: [root],
       approvedBy: "John",
     });
 
@@ -181,6 +184,7 @@ describe("appliance backup rollback audit helpers", () => {
         restorePluginWriteArchive({
           archivePath: archive.archivePath,
           auditLogPath,
+          allowedTargetRoots: [root],
           approvedBy: "John",
         }),
       ).rejects.toThrow(/archivePath/u);
@@ -213,12 +217,87 @@ describe("appliance backup rollback audit helpers", () => {
       restorePluginWriteArchive({
         archivePath: archive.archivePath,
         auditLogPath,
+        allowedTargetRoots: [root],
         approvedBy: "John",
       }),
     ).rejects.toThrow(/archivePath/u);
     await expect(fs.readFile(missingThenCreated, "utf8")).resolves.toBe(
       "created after archive\n",
     );
+  });
+
+  it("rejects tampered manifest target paths outside allowed roots before deleting", async () => {
+    const root = await makeTempDir();
+    const allowedRoot = path.join(root, "allowed");
+    const outsideRoot = path.join(root, "outside");
+    const missingThenCreated = path.join(allowedRoot, "created.txt");
+    const outsideVictim = path.join(outsideRoot, "victim.txt");
+    const auditLogPath = path.join(root, "audit.jsonl");
+    await fs.mkdir(allowedRoot, { recursive: true });
+    await fs.mkdir(outsideRoot, { recursive: true });
+    await fs.writeFile(outsideVictim, "must survive\n", "utf8");
+
+    const archive = await createPluginWriteArchive({
+      coldStorageDir: path.join(root, "cold"),
+      auditLogPath,
+      writeSet: {
+        operationId: "op-tampered-target",
+        plugin: "file-reorg",
+        files: [missingThenCreated],
+      },
+    });
+    await fs.writeFile(missingThenCreated, "created after archive\n", "utf8");
+    archive.manifest.entries[0].targetPath = outsideVictim;
+    archive.manifest.entries[0].targetPathSha256 = crypto
+      .createHash("sha256")
+      .update(outsideVictim)
+      .digest("hex");
+    await fs.writeFile(archive.manifestPath, `${JSON.stringify(archive.manifest, null, 2)}\n`);
+
+    await expect(
+      restorePluginWriteArchive({
+        archivePath: archive.archivePath,
+        auditLogPath,
+        allowedTargetRoots: [allowedRoot],
+        approvedBy: "John",
+      }),
+    ).rejects.toThrow(/allowed target root/u);
+    await expect(fs.readFile(outsideVictim, "utf8")).resolves.toBe("must survive\n");
+    await expect(fs.readFile(missingThenCreated, "utf8")).resolves.toBe("created after archive\n");
+  });
+
+  it("rejects restore targets that escape allowed roots through symlink ancestors", async () => {
+    const root = await makeTempDir();
+    const allowedRoot = path.join(root, "allowed");
+    const outsideRoot = path.join(root, "outside");
+    const symlinkRoot = path.join(allowedRoot, "link");
+    const linkedTarget = path.join(symlinkRoot, "victim.txt");
+    const outsideVictim = path.join(outsideRoot, "victim.txt");
+    const auditLogPath = path.join(root, "audit.jsonl");
+    await fs.mkdir(allowedRoot, { recursive: true });
+    await fs.mkdir(outsideRoot, { recursive: true });
+    await fs.symlink(outsideRoot, symlinkRoot);
+
+    const archive = await createPluginWriteArchive({
+      coldStorageDir: path.join(root, "cold"),
+      auditLogPath,
+      writeSet: {
+        operationId: "op-symlink-target",
+        plugin: "file-reorg",
+        files: [linkedTarget],
+      },
+    });
+    await fs.writeFile(outsideVictim, "must survive\n", "utf8");
+
+    await expect(
+      restorePluginWriteArchive({
+        archivePath: archive.archivePath,
+        auditLogPath,
+        allowedTargetRoots: [allowedRoot],
+        approvedBy: "John",
+      }),
+    ).rejects.toThrow(/allowed target root/u);
+    await expect(fs.readFile(outsideVictim, "utf8")).resolves.toBe("must survive\n");
   });
 
   it("runs a synthetic rollback drill with no client data", async () => {
