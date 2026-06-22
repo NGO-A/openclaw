@@ -7,6 +7,7 @@ import path from "node:path";
 import process from "node:process";
 
 const BACKUP_ARCHIVE_PATTERN = /openclaw-backup\.tar\.gz$/u;
+const SAFE_PATH_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 
 function usage() {
   return `Usage:
@@ -81,6 +82,50 @@ function assertAbsoluteSafePath(targetPath) {
   return path.resolve(targetPath);
 }
 
+function assertSafePathSegment(value, label) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`${label} must be a non-empty path segment`);
+  }
+  if (value.includes("\0")) {
+    throw new Error(`${label} must not contain NUL bytes`);
+  }
+  if (
+    value === "." ||
+    value === ".." ||
+    path.isAbsolute(value) ||
+    value.includes("/") ||
+    value.includes("\\") ||
+    !SAFE_PATH_SEGMENT_PATTERN.test(value)
+  ) {
+    throw new Error(`${label} must be a safe path segment: ${value}`);
+  }
+  return value;
+}
+
+function assertPathInside(parentPath, targetPath, label) {
+  const parent = path.resolve(parentPath);
+  const target = path.resolve(targetPath);
+  const relative = path.relative(parent, target);
+  if (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+    return target;
+  }
+  throw new Error(`${label} must remain under ${parent}`);
+}
+
+function assertArchiveRelativePath(archiveRoot, archivePath) {
+  if (typeof archivePath !== "string" || archivePath.trim() === "") {
+    throw new Error("archivePath must be a non-empty relative path");
+  }
+  if (archivePath.includes("\0")) {
+    throw new Error(`archivePath must not contain NUL bytes: ${archivePath}`);
+  }
+  if (path.isAbsolute(archivePath) || archivePath.includes("\\")) {
+    throw new Error(`archivePath must be a relative archive member path: ${archivePath}`);
+  }
+  const sourcePath = path.resolve(archiveRoot, archivePath);
+  return assertPathInside(archiveRoot, sourcePath, `archivePath ${archivePath}`);
+}
+
 function timestampForPath(now = new Date()) {
   return now.toISOString().replaceAll(":", "-");
 }
@@ -149,6 +194,7 @@ async function buildArchivedEntry(params) {
   const fileHash = stat?.isFile() ? await hashFile(targetPath) : null;
   return {
     targetPath,
+    targetPathSha256: sha256Hex(targetPath),
     originalExists: Boolean(stat),
     originalType: stat ? (stat.isDirectory() ? "directory" : "file") : "missing",
     archivePath: archiveRelativePath,
@@ -185,14 +231,20 @@ function normalizeWriteSet(raw, overrides = {}) {
   if (files.length === 0) {
     throw new Error("write-set manifest must contain a non-empty files or paths array");
   }
-  return {
-    operationId:
-      typeof raw?.operationId === "string" && raw.operationId.trim()
-        ? raw.operationId
-        : operationId("write"),
-    plugin:
-      overrides.plugin ??
+  const operation = assertSafePathSegment(
+    typeof raw?.operationId === "string" && raw.operationId.trim()
+      ? raw.operationId
+      : operationId("write"),
+    "operationId",
+  );
+  const plugin = assertSafePathSegment(
+    overrides.plugin ??
       (typeof raw?.plugin === "string" && raw.plugin.trim() ? raw.plugin : "unknown-plugin"),
+    "plugin",
+  );
+  return {
+    operationId: operation,
+    plugin,
     approvedBy:
       overrides.approvedBy ??
       (typeof raw?.approvedBy === "string" && raw.approvedBy.trim() ? raw.approvedBy : null),
@@ -216,10 +268,10 @@ export async function createPluginWriteArchive(params) {
     approvalId: params.approvalId,
     reason: params.reason,
   });
-  const archiveRoot = path.join(
+  const archiveRoot = assertPathInside(
     coldStorageDir,
-    writeSet.plugin,
-    `${timestampForPath()}-${writeSet.operationId}`,
+    path.join(coldStorageDir, writeSet.plugin, `${timestampForPath()}-${writeSet.operationId}`),
+    "archiveRoot",
   );
   await fs.mkdir(path.dirname(archiveRoot), { recursive: true, mode: 0o700 });
   await fs.mkdir(archiveRoot, { recursive: false, mode: 0o700 });
@@ -258,20 +310,73 @@ export async function createPluginWriteArchive(params) {
   return { archivePath: archiveRoot, manifestPath, manifest };
 }
 
-async function restoreEntry(archiveRoot, entry) {
-  const targetPath = assertAbsoluteSafePath(entry.targetPath);
+function validateArchiveManifestEntry(archiveRoot, rawEntry, index) {
+  if (!rawEntry || typeof rawEntry !== "object") {
+    throw new Error(`Archive manifest entry ${index} must be an object`);
+  }
+  const targetPath = assertAbsoluteSafePath(rawEntry.targetPath);
+  if (!/^[a-f0-9]{64}$/u.test(rawEntry.targetPathSha256)) {
+    throw new Error(`Archive manifest entry ${index} targetPathSha256 must be a sha256 hex digest`);
+  }
+  if (rawEntry.targetPathSha256 !== sha256Hex(targetPath)) {
+    throw new Error(`Archive manifest entry ${index} targetPath hash does not match targetPath`);
+  }
+  if (rawEntry.originalExists !== true && rawEntry.originalExists !== false) {
+    throw new Error(`Archive manifest entry ${index} originalExists must be boolean`);
+  }
+  if (!["file", "directory", "missing"].includes(rawEntry.originalType)) {
+    throw new Error(`Archive manifest entry ${index} has unsupported originalType`);
+  }
+  if (!rawEntry.originalExists && rawEntry.originalType !== "missing") {
+    throw new Error(
+      `Archive manifest entry ${index} missing originals must use originalType=missing`,
+    );
+  }
+  if (rawEntry.originalExists && rawEntry.originalType === "missing") {
+    throw new Error(
+      `Archive manifest entry ${index} existing originals must not use originalType=missing`,
+    );
+  }
+  if (!rawEntry.originalExists && rawEntry.archivePath != null) {
+    throw new Error(`Archive manifest entry ${index} missing originals must not have archivePath`);
+  }
+  const sourcePath = rawEntry.originalExists
+    ? assertArchiveRelativePath(archiveRoot, rawEntry.archivePath)
+    : null;
+  if (rawEntry.originalType === "file") {
+    if (rawEntry.originalSha256 != null && !/^[a-f0-9]{64}$/u.test(rawEntry.originalSha256)) {
+      throw new Error(`Archive manifest entry ${index} originalSha256 must be a sha256 hex digest`);
+    }
+    if (rawEntry.originalMode != null && !Number.isInteger(rawEntry.originalMode)) {
+      throw new Error(`Archive manifest entry ${index} originalMode must be an integer`);
+    }
+  }
+  return {
+    targetPath,
+    originalExists: rawEntry.originalExists,
+    originalType: rawEntry.originalType,
+    archivePath: rawEntry.archivePath ?? null,
+    sourcePath,
+    originalSha256: rawEntry.originalSha256 ?? null,
+    originalMode: rawEntry.originalMode ?? null,
+  };
+}
+
+function validateArchiveManifestEntries(archiveRoot, manifest) {
+  const entries = Array.isArray(manifest.entries) ? manifest.entries : [];
+  return entries.map((entry, index) => validateArchiveManifestEntry(archiveRoot, entry, index));
+}
+
+async function restoreEntry(entry) {
+  const { targetPath } = entry;
   if (!entry.originalExists) {
     await fs.rm(targetPath, { recursive: true, force: true });
     return { targetPath, restored: "removed-created-path", verified: true };
   }
-  if (!entry.archivePath) {
-    throw new Error(`Archive entry for ${targetPath} is missing archivePath`);
-  }
-  const sourcePath = path.join(archiveRoot, entry.archivePath);
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   if (entry.originalType === "directory") {
     await fs.rm(targetPath, { recursive: true, force: true });
-    await fs.cp(sourcePath, targetPath, {
+    await fs.cp(entry.sourcePath, targetPath, {
       recursive: true,
       dereference: false,
       force: false,
@@ -279,7 +384,7 @@ async function restoreEntry(archiveRoot, entry) {
     });
     return { targetPath, restored: "directory", verified: true };
   }
-  await fs.copyFile(sourcePath, targetPath);
+  await fs.copyFile(entry.sourcePath, targetPath);
   if (Number.isInteger(entry.originalMode)) {
     await fs.chmod(targetPath, entry.originalMode).catch(() => undefined);
   }
@@ -296,10 +401,10 @@ export async function restorePluginWriteArchive(params) {
   if (manifest?.kind !== "openclaw-appliance-plugin-write-archive") {
     throw new Error(`Unsupported rollback archive manifest in ${archiveRoot}`);
   }
-  const entries = Array.isArray(manifest.entries) ? manifest.entries : [];
+  const entries = validateArchiveManifestEntries(archiveRoot, manifest);
   const restored = [];
   for (const entry of entries.toReversed()) {
-    restored.push(await restoreEntry(archiveRoot, entry));
+    restored.push(await restoreEntry(entry));
   }
   await appendAuditEvent(params.auditLogPath, {
     event: "plugin.write.rollback.completed",
@@ -365,7 +470,7 @@ export async function pruneBackupArchives(params) {
   };
 }
 
-function runPnpmOpenClawBackup(outputDir, dryRun, noIncludeWorkspace) {
+export function buildOpenClawBackupArgs(outputDir, dryRun, noIncludeWorkspace) {
   const args = ["openclaw", "backup", "create", "--output", outputDir, "--verify", "--json"];
   if (noIncludeWorkspace) {
     args.push("--no-include-workspace");
@@ -373,6 +478,11 @@ function runPnpmOpenClawBackup(outputDir, dryRun, noIncludeWorkspace) {
   if (dryRun) {
     args.push("--dry-run");
   }
+  return args;
+}
+
+function runPnpmOpenClawBackup(outputDir, dryRun, noIncludeWorkspace) {
+  const args = buildOpenClawBackupArgs(outputDir, dryRun, noIncludeWorkspace);
   return new Promise((resolve, reject) => {
     const child = spawn("pnpm", args, {
       cwd: process.cwd(),
@@ -401,7 +511,8 @@ function runPnpmOpenClawBackup(outputDir, dryRun, noIncludeWorkspace) {
 export async function runVerifiedBackup(params) {
   const outputDir = path.resolve(params.outputDir);
   await fs.mkdir(outputDir, { recursive: true, mode: 0o700 });
-  const backup = await runPnpmOpenClawBackup(
+  const backupRunner = params.backupRunner ?? runPnpmOpenClawBackup;
+  const backup = await backupRunner(
     outputDir,
     params.dryRun === true,
     params.noIncludeWorkspace === true,

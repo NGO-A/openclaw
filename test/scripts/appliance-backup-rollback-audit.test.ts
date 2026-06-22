@@ -3,8 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  buildOpenClawBackupArgs,
   createPluginWriteArchive,
   pruneBackupArchives,
+  runVerifiedBackup,
   restorePluginWriteArchive,
   runRollbackDrill,
 } from "../../scripts/appliance-backup-rollback-audit.mjs";
@@ -118,6 +120,107 @@ describe("appliance backup rollback audit helpers", () => {
     });
   });
 
+  it("rejects plugin and operation ids that are not safe path segments", async () => {
+    const root = await makeTempDir();
+    const liveFile = path.join(root, "files", "matter.txt");
+    const coldStorageDir = path.join(root, "cold-storage");
+    await fs.mkdir(path.dirname(liveFile), { recursive: true });
+    await fs.writeFile(liveFile, "original\n", "utf8");
+
+    await expect(
+      createPluginWriteArchive({
+        coldStorageDir,
+        writeSet: {
+          operationId: "op-1",
+          plugin: "../escape",
+          files: [liveFile],
+        },
+      }),
+    ).rejects.toThrow(/plugin must be a safe path segment/u);
+
+    await expect(
+      createPluginWriteArchive({
+        coldStorageDir,
+        writeSet: {
+          operationId: "../escape",
+          plugin: "file-reorg",
+          files: [liveFile],
+        },
+      }),
+    ).rejects.toThrow(/operationId must be a safe path segment/u);
+    await expect(fs.stat(path.join(root, "escape"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects restore archives with traversal or absolute archive paths", async () => {
+    const root = await makeTempDir();
+    const liveFile = path.join(root, "files", "matter.txt");
+    const auditLogPath = path.join(root, "audit.jsonl");
+    await fs.mkdir(path.dirname(liveFile), { recursive: true });
+    await fs.writeFile(liveFile, "original\n", "utf8");
+
+    for (const archivePath of ["../escape.file", path.join(root, "escape.file")]) {
+      const storageKind = archivePath.startsWith("..") ? "relative" : "absolute";
+      const archive = await createPluginWriteArchive({
+        coldStorageDir: path.join(root, `cold-${storageKind}`),
+        auditLogPath,
+        writeSet: {
+          operationId: `op-${storageKind}`,
+          plugin: "file-reorg",
+          files: [liveFile],
+        },
+      });
+      await fs.writeFile(liveFile, "corrupted\n", "utf8");
+      archive.manifest.entries[0].archivePath = archivePath;
+      await fs.writeFile(
+        archive.manifestPath,
+        `${JSON.stringify(archive.manifest, null, 2)}\n`,
+        "utf8",
+      );
+
+      await expect(
+        restorePluginWriteArchive({
+          archivePath: archive.archivePath,
+          auditLogPath,
+          approvedBy: "John",
+        }),
+      ).rejects.toThrow(/archivePath/u);
+      await expect(fs.readFile(liveFile, "utf8")).resolves.toBe("corrupted\n");
+    }
+  });
+
+  it("validates all restore manifest entries before deleting missing-original targets", async () => {
+    const root = await makeTempDir();
+    const missingThenCreated = path.join(root, "files", "created.txt");
+    const existingFile = path.join(root, "files", "existing.txt");
+    const auditLogPath = path.join(root, "audit.jsonl");
+    await fs.mkdir(path.dirname(existingFile), { recursive: true });
+    await fs.writeFile(existingFile, "original\n", "utf8");
+
+    const archive = await createPluginWriteArchive({
+      coldStorageDir: path.join(root, "cold"),
+      auditLogPath,
+      writeSet: {
+        operationId: "op-validate-first",
+        plugin: "file-reorg",
+        files: [missingThenCreated, existingFile],
+      },
+    });
+    await fs.writeFile(missingThenCreated, "created after archive\n", "utf8");
+    archive.manifest.entries[1].archivePath = "../escape.file";
+    await fs.writeFile(archive.manifestPath, `${JSON.stringify(archive.manifest, null, 2)}\n`);
+
+    await expect(
+      restorePluginWriteArchive({
+        archivePath: archive.archivePath,
+        auditLogPath,
+        approvedBy: "John",
+      }),
+    ).rejects.toThrow(/archivePath/u);
+    await expect(fs.readFile(missingThenCreated, "utf8")).resolves.toBe(
+      "created after archive\n",
+    );
+  });
+
   it("runs a synthetic rollback drill with no client data", async () => {
     const root = await makeTempDir();
     const result = await runRollbackDrill({
@@ -179,5 +282,77 @@ describe("appliance backup rollback audit helpers", () => {
     await expect(fs.stat(path.join(root, archiveNames[2]))).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  it("wraps verified backups with stable args and audit metadata", async () => {
+    const root = await makeTempDir();
+    const outputDir = path.join(root, "backups");
+    const auditLogPath = path.join(root, "audit", "appliance.jsonl");
+    const backupCalls: Array<{
+      outputDir: string;
+      dryRun: boolean;
+      noIncludeWorkspace: boolean;
+      args: string[];
+    }> = [];
+
+    const result = await runVerifiedBackup({
+      outputDir,
+      auditLogPath,
+      dryRun: true,
+      noIncludeWorkspace: true,
+      retentionCount: 7,
+      retentionDays: 30,
+      backupRunner: async (
+        resolvedOutputDir: string,
+        dryRun: boolean,
+        noIncludeWorkspace: boolean,
+      ) => {
+        backupCalls.push({
+          outputDir: resolvedOutputDir,
+          dryRun,
+          noIncludeWorkspace,
+          args: buildOpenClawBackupArgs(resolvedOutputDir, dryRun, noIncludeWorkspace),
+        });
+        return { stdout: "{\"ok\":true}\n", stderr: "" };
+      },
+    });
+
+    expect(result).toMatchObject({
+      outputDir,
+      noIncludeWorkspace: true,
+      pruning: expect.objectContaining({
+        dryRun: true,
+        retentionCount: 7,
+        retentionDays: 30,
+      }),
+    });
+    expect(backupCalls).toEqual([
+      {
+        outputDir,
+        dryRun: true,
+        noIncludeWorkspace: true,
+        args: [
+          "openclaw",
+          "backup",
+          "create",
+          "--output",
+          outputDir,
+          "--verify",
+          "--json",
+          "--no-include-workspace",
+          "--dry-run",
+        ],
+      },
+    ]);
+    expect(await readAuditEvents(auditLogPath)).toEqual([
+      expect.objectContaining({
+        event: "appliance.backup.completed",
+        outputDir,
+        retentionCount: 7,
+        retentionDays: 30,
+        dryRun: true,
+        noIncludeWorkspace: true,
+      }),
+    ]);
   });
 });
