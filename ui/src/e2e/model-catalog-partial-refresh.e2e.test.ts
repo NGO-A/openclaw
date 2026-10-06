@@ -242,7 +242,64 @@ suite.define(() => {
     });
   });
 
-  it.each(["empty", "rejected", "retained rejection", "selected unavailable", "non-reasoning"])(
+  it("keeps usable effort controls when the catalog refresh is rejected but a snapshot is retained", async () => {
+    await suite.withPage({ locale: "en-US" }, async ({ page }) => {
+      const selected = catalog.models[0]!;
+      const failure = { __mockError: { code: "UNAVAILABLE", message: "Catalog request failed" } };
+      const gateway = await installMockGateway(page, {
+        agentModel: partialConfig.agents.defaults.model,
+        models: catalog.models,
+        sessionInfo: {
+          model: selected.id,
+          modelProvider: selected.provider,
+          thinkingLevels: levels,
+        },
+        methodResponses: {
+          "models.list": catalog,
+          "sessions.list": {
+            ts: 1,
+            path: "",
+            count: 1,
+            defaults: {
+              model: selected.id,
+              modelProvider: selected.provider,
+              thinkingLevels: levels,
+              thinkingDefault: "high",
+            },
+            sessions: [
+              {
+                key: "agent:main:main",
+                kind: "direct",
+                model: selected.id,
+                modelProvider: selected.provider,
+                thinkingLevels: levels,
+                thinkingDefault: "high",
+              },
+            ],
+          },
+        },
+      });
+      await page.goto(`${suite.server.baseUrl}chat`);
+      const model = page.locator("[data-chat-model-select]");
+      await expect.poll(() => model.getAttribute("aria-busy")).toBe("false");
+      await expect.poll(() => page.locator("[data-chat-thinking-select]").isVisible()).toBe(true);
+
+      await gateway.setMethodResponse("models.list", failure);
+      await model.click();
+      await expect
+        .poll(() => page.locator('[data-chat-model-catalog-state="error"]').isVisible())
+        .toBe(true);
+
+      const effort = page.locator("[data-chat-thinking-select]");
+      await expect.poll(() => effort.isVisible()).toBe(true);
+      expect(await effort.getAttribute("aria-disabled")).toBe("false");
+      await effort.click();
+      await expect.poll(() => page.locator("[data-chat-thinking-slider]").isEnabled()).toBe(true);
+      expect(await gateway.getRequests("sessions.patch")).toHaveLength(0);
+    });
+  });
+
+  it.each(["empty", "rejected", "selected unavailable", "non-reasoning"])(
     "does not expose usable effort for %s",
     async (condition) => {
       await suite.withPage({ locale: "en-US" }, async ({ page }) => {
